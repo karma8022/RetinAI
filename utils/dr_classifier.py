@@ -1,10 +1,11 @@
 import ollama
-from typing import Dict, Any
+from typing import Dict, Any, Tuple
 import tempfile
 import os
 import logging
 import cv2
 import numpy as np
+import re
 
 # Set up logging
 logging.basicConfig(level=logging.DEBUG)
@@ -13,18 +14,79 @@ logger = logging.getLogger(__name__)
 class DRClassifier:
     # Constants
     MODEL_NAME: str = "rohithbojja/llava-med-v1.6"  # Using medical-specific LLaVA model
-    PROMPT_TEMPLATE: str = """Analyze this retinal image and classify the severity of diabetic retinopathy (DR) according to this scale:
+    PROMPT_TEMPLATE: str = """Analyze this retinal image by CAREFULLY COUNTING the colored markers:
 
-0: No DR — No signs of diabetic retinopathy
-1: Mild — Microaneurysms only
-2: Moderate — More than just microaneurysms but less than severe nonproliferative DR
-3: Severe — More than 20 intraretinal hemorrhages in each quadrant, venous beading in 2+ quadrants, IRMA in 1+ quadrant
-4: Proliferative DR — Neovascularization and/or vitreous/preretinal hemorrhage
+MARKER LEGEND:
+- Yellow (CTW): Cotton Wool Spots
+- Green (EX): Exudates
+- Light Blue (HE): Hemorrhages
+- Dark Blue (MA): Microaneurysms
 
-Provide ONLY:
-1. The numeric grade (0-4)
-2. A brief, specific justification based on what you see in THIS image
-Do not give general descriptions or disclaimers."""
+COUNTING INSTRUCTIONS:
+1. Count each colored marker individually
+2. Note the location (quadrant) of each marker
+3. Small, isolated dots count as individual markers
+4. Clusters should be counted as separate markers if distinct
+
+Grade DR severity using these EXACT marker counts:
+
+0 (No DR):
+- NO markers of any color present
+- Completely clean image
+
+1 (Mild NPDR):
+- ONLY 1-2 dark blue (MA) markers
+- NO other colored markers present
+- If ANY other colors exist, grade higher
+
+2 (Moderate NPDR):
+- 3-5 markers total of any type OR
+- Small cluster of green (EX) markers OR
+- Any combination of 2-3 different colored markers
+- But less than severe criteria
+
+3 (Severe NPDR):
+- More than 5 markers total OR
+- Large cluster of any marker type OR
+- 3 or more different colored markers present
+
+4 (Proliferative DR):
+- Only grade as 4 if there are obvious signs of neovascularization
+- These would appear as irregular vessel patterns
+- Do NOT grade as 4 based on markers alone
+
+OUTPUT FORMAT:
+Grade: [0-4]
+Justification: [List EXACT COUNT of each colored marker by type and location]"""
+
+    @staticmethod
+    def _parse_response(response_text: str) -> Tuple[int, str]:
+        """
+        Parse the model's response to extract grade and justification.
+        
+        Args:
+            response_text: Raw response from the model
+            
+        Returns:
+            Tuple of (grade, justification)
+            
+        Raises:
+            ValueError: If unable to parse grade or grade is invalid
+        """
+        # Extract grade using regex
+        grade_match = re.search(r"Grade:\s*(\d+)", response_text)
+        if not grade_match:
+            raise ValueError("Could not find grade in model response")
+            
+        grade = int(grade_match.group(1))
+        if grade < 0 or grade > 4:
+            raise ValueError(f"Invalid grade {grade}, must be between 0 and 4")
+            
+        # Extract justification
+        justification_match = re.search(r"Justification:\s*(.+)", response_text)
+        justification = justification_match.group(1) if justification_match else "No justification provided"
+        
+        return grade, justification
 
     @staticmethod
     def classify_severity(image_bytes: bytes) -> Dict[str, Any]:
@@ -82,7 +144,7 @@ Do not give general descriptions or disclaimers."""
                 prompt=DRClassifier.PROMPT_TEMPLATE,
                 images=[temp_path]
             )
-            logger.debug("Received response from Ollama API")
+            logger.debug(f"Raw model response: {response['response']}")
             
             if not response or "response" not in response:
                 raise ValueError("No response from Ollama API")
@@ -93,10 +155,24 @@ Do not give general descriptions or disclaimers."""
                     "error": "Model failed to process the image properly"
                 }
             
-            return {
-                "success": True,
-                "classification": response["response"]
-            }
+            # Parse and validate the response
+            try:
+                grade, justification = DRClassifier._parse_response(response["response"])
+                logger.debug(f"Parsed response - Grade: {grade}, Justification: {justification}")
+                
+                return {
+                    "success": True,
+                    "classification": f"Grade: {grade}\nJustification: {justification}",
+                    "grade": grade,
+                    "justification": justification,
+                    "raw_response": response["response"]
+                }
+            except ValueError as ve:
+                return {
+                    "success": False,
+                    "error": f"Failed to parse model response: {str(ve)}",
+                    "raw_response": response.get("response", "No response")
+                }
             
         except Exception as e:
             logger.error(f"Classification error: {str(e)}", exc_info=True)
